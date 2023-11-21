@@ -9,7 +9,10 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"syscall"
+	"time"
 )
 
 const (
@@ -18,7 +21,7 @@ const (
 )
 
 var pictureFileExtensions = []string{".jpg", ".png", ".heic", ".jpeg"}
-var videoFileExtensions = []string{".mp4", ".mov"}
+var videoFileExtensions = []string{".mp4", ".mov", ".webp"}
 
 var sourceDirArg = flag.String("source", "", "Source directory")
 var outDirArg = flag.String("out", "", "Output directory")
@@ -98,19 +101,14 @@ func sortFiles(sourceDir string, outDir string, fileExtensions []string, sortInt
 
 func copyFile(fileInfo fs.FileInfo, sourceDir string, outDir string, sortIntoCategories bool) (string, error) {
 	fileName := fileInfo.Name()
-	fileCreationDate := fileInfo.ModTime()
+	fileCreationDate := getFileCreatedDateTime(fileInfo)
 	fileCreationYear := fileCreationDate.Year()
 	fileCreationMonth := fileCreationDate.Month()
 	fileCreationDay := fileCreationDate.Day()
 
 	log.Printf("file %s created on %d-%02d-%02d", fileName, fileCreationYear, fileCreationMonth, fileCreationDay)
 
-	yearDir := path.Join(outDir, fmt.Sprintf("%d", fileCreationYear))
-	if err := createDirIfNotExists(yearDir); err != nil {
-		return "", fmt.Errorf("create year directory %s: %v", yearDir, err)
-	}
-
-	monthDir := path.Join(yearDir, fmt.Sprintf("%d-%02d", fileCreationYear, fileCreationMonth))
+	monthDir := path.Join(outDir, fmt.Sprintf("%d-%02d", fileCreationYear, fileCreationMonth))
 	if err := createDirIfNotExists(monthDir); err != nil {
 		return "", fmt.Errorf("create month directory %s: %v", monthDir, err)
 	}
@@ -130,6 +128,17 @@ func copyFile(fileInfo fs.FileInfo, sourceDir string, outDir string, sortIntoCat
 	}
 
 	return outPath, nil
+}
+
+func getFileCreatedDateTime(fileInfo fs.FileInfo) time.Time {
+	created := fileInfo.ModTime()
+
+	if runtime.GOOS == "windows" {
+		attr := fileInfo.Sys().(*syscall.Win32FileAttributeData)
+		created = time.Unix(0, attr.CreationTime.Nanoseconds())
+	}
+
+	return created
 }
 
 func constructOutPath(parentPath string, fileName string, sortIntoCategories bool) (string, error) {
@@ -157,11 +166,50 @@ func constructOutPath(parentPath string, fileName string, sortIntoCategories boo
 }
 
 func preserveOriginalFileCreationDate(fileInfo os.FileInfo, filePath string) error {
-	modifiedTime := fileInfo.ModTime()
-	accessTime := fileInfo.ModTime()
+	createdTime := getFileCreatedDateTime(fileInfo)
+
+	if runtime.GOOS == "windows" {
+		return setWindowsFileCreationDateTime(filePath, createdTime)
+	}
+
+	modifiedTime := createdTime
+	accessTime := createdTime
 
 	if err := os.Chtimes(filePath, accessTime, modifiedTime); err != nil {
 		return fmt.Errorf("set file %s modification time: %v", fileInfo.Name(), err)
+	}
+
+	return nil
+}
+
+func setWindowsFileCreationDateTime(filename string, ctime time.Time) error {
+	filePath, err := syscall.UTF16PtrFromString(filename)
+	if err != nil {
+		return fmt.Errorf("resolve filePath from filename %s: %v", filename, err)
+	}
+
+	// Open the file with proper permissions to modify the file times
+	handle, err := syscall.CreateFile(
+		filePath,
+		syscall.FILE_WRITE_ATTRIBUTES, syscall.FILE_SHARE_WRITE, nil,
+		syscall.OPEN_EXISTING, syscall.FILE_ATTRIBUTE_NORMAL, 0)
+
+	if err != nil {
+		return fmt.Errorf("open file %v: %v", *filePath, err)
+	}
+	defer func() {
+		if err := syscall.CloseHandle(handle); err != nil {
+			log.Fatalf("close syscall filehandler for %s: %v", filename, err)
+		}
+	}()
+
+	// Create a Filetime structure from the Go time
+	fileTime := syscall.NsecToFiletime(ctime.UnixNano())
+
+	// Set the creation time (leaving access and write times as nil will not modify them)
+	err = syscall.SetFileTime(handle, &fileTime, nil, nil)
+	if err != nil {
+		return fmt.Errorf("update file time for %s to %+v: %v", filename, fileTime, err)
 	}
 
 	return nil
