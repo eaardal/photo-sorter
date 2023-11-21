@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path"
 )
 
 var sourceDir = flag.String("source", "", "Source directory")
@@ -65,22 +66,23 @@ func sortPhotos(sourceDir string, outDir string) error {
 
 		log.Printf("file %s created on %d-%02d", entry.Name(), fileCreationYear, fileCreationMonth)
 
-		yearDir := fmt.Sprintf("%s/%d", outDir, fileCreationYear)
+		yearDir := path.Join(outDir, fmt.Sprintf("%d", fileCreationYear))
 		if err := createDirIfNotExists(yearDir); err != nil {
 			return fmt.Errorf("create year directory %s: %v", yearDir, err)
 		}
 
-		monthDir := fmt.Sprintf("%s/%d-%02d", yearDir, fileCreationYear, fileCreationMonth)
+		monthDir := path.Join(yearDir, fmt.Sprintf("%d-%02d", fileCreationYear, fileCreationMonth))
 		if err := createDirIfNotExists(monthDir); err != nil {
 			return fmt.Errorf("create month directory %s: %v", monthDir, err)
 		}
 
-		fileContent, err := os.ReadFile(fmt.Sprintf("%s/%s", sourceDir, entry.Name()))
+		filePath := path.Join(sourceDir, entry.Name())
+		fileContent, err := os.ReadFile(filePath)
 		if err != nil {
 			return fmt.Errorf("read file %s: %v", entry.Name(), err)
 		}
 
-		outPath := fmt.Sprintf("%s/%s", monthDir, entry.Name())
+		outPath := path.Join(monthDir, entry.Name())
 		if err := os.WriteFile(outPath, fileContent, 0644); err != nil {
 			return fmt.Errorf("write file %s: %v", entry.Name(), err)
 		}
