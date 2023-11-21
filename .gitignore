@@ -1,3 +1,4 @@
 .idea/
 photosorter
 dist/
+.DS_Store
