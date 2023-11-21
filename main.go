@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -14,23 +15,23 @@ func main() {
 	flag.Parse()
 
 	if sourceDir == nil {
-		panic("source directory not specified")
+		log.Fatal("source directory not specified")
 	}
 
-	if !DirExists(*sourceDir) {
-		panic("source directory does not exist")
+	if !dirExists(*sourceDir) {
+		log.Fatal("source directory does not exist")
 	}
 
 	if outDir == nil {
-		panic("out directory not specified")
+		log.Fatal("out directory not specified")
 	}
 
-	if err := CreateDirIfNotExists(*outDir); err != nil {
-		panic(err)
+	if err := createDirIfNotExists(*outDir); err != nil {
+		log.Fatal(err)
 	}
 
 	if err := sortPhotos(*sourceDir, *outDir); err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
 }
 
@@ -51,11 +52,10 @@ func sortPhotos(sourceDir string, outDir string) error {
 			return fmt.Errorf("get file info for %s: %v", entry.Name(), err)
 		}
 
-		// get file extension
-		//fileExt := fileInfo.Name()[len(fileInfo.Name())-4:]
-		//if fileExt != ".jpg" && fileExt != ".png" {
-		//	continue
-		//}
+		if !isPicture(fileInfo) {
+			log.Printf("file %s is not a picture, skipping", entry.Name())
+			continue
+		}
 
 		log.Printf("processing file %s", entry.Name())
 
@@ -66,12 +66,12 @@ func sortPhotos(sourceDir string, outDir string) error {
 		log.Printf("file %s created on %d-%02d", entry.Name(), fileCreationYear, fileCreationMonth)
 
 		yearDir := fmt.Sprintf("%s/%d", outDir, fileCreationYear)
-		if err := CreateDirIfNotExists(yearDir); err != nil {
+		if err := createDirIfNotExists(yearDir); err != nil {
 			return fmt.Errorf("create year directory %s: %v", yearDir, err)
 		}
 
 		monthDir := fmt.Sprintf("%s/%d-%02d", yearDir, fileCreationYear, fileCreationMonth)
-		if err := CreateDirIfNotExists(monthDir); err != nil {
+		if err := createDirIfNotExists(monthDir); err != nil {
 			return fmt.Errorf("create month directory %s: %v", monthDir, err)
 		}
 
@@ -89,4 +89,39 @@ func sortPhotos(sourceDir string, outDir string) error {
 	}
 
 	return nil
+}
+
+func isPicture(fileInfo os.FileInfo) bool {
+	return true // Just sort all files for now
+
+	//fileExt := fileInfo.Name()[len(fileInfo.Name())-4:]
+	//return fileExt == ".jpg" || fileExt == ".png"
+}
+
+func dirExists(path string) bool {
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		return false
+	}
+	return true
+}
+
+func createDirIfNotExists(path string) error {
+	err := os.Mkdir(path, 0777)
+	if err == nil {
+		return nil
+	}
+
+	if os.IsExist(err) {
+		stat, err := os.Stat(path)
+		if err != nil {
+			return fmt.Errorf("os.Stat: failed to read %s: %v", path, err)
+		}
+
+		if !stat.IsDir() {
+			return fmt.Errorf("path %s exists but is not a directory", path)
+		}
+		return nil
+	}
+
+	return err
 }
