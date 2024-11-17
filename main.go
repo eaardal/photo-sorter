@@ -4,6 +4,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/rwcarlsen/goexif/exif"
 	"io/fs"
 	"log"
 	"os"
@@ -18,10 +19,12 @@ import (
 const (
 	PicturesDirName = "pictures"
 	VideosDirName   = "videos"
+	GifsDirName     = "gifs"
 )
 
-var pictureFileExtensions = []string{".jpg", ".png", ".heic", ".jpeg"}
+var pictureFileExtensions = []string{".jpg", ".png", ".heic", ".jpeg", ".dng", ".arw"}
 var videoFileExtensions = []string{".mp4", ".mov", ".webp"}
+var gifFileExtensions = []string{".gif"}
 
 var sourceDirArg = flag.String("source", "", "Source directory")
 var outDirArg = flag.String("out", "", "Output directory")
@@ -101,7 +104,7 @@ func sortFiles(sourceDir string, outDir string, fileExtensions []string, sortInt
 
 func copyFile(fileInfo fs.FileInfo, sourceDir string, outDir string, sortIntoCategories bool) (string, error) {
 	fileName := fileInfo.Name()
-	fileCreationDate := getFileCreatedDateTime(fileInfo)
+	fileCreationDate := getFileCreatedDateTime(fileInfo, sourceDir)
 	fileCreationYear := fileCreationDate.Year()
 	fileCreationMonth := fileCreationDate.Month()
 	fileCreationDay := fileCreationDate.Day()
@@ -130,7 +133,12 @@ func copyFile(fileInfo fs.FileInfo, sourceDir string, outDir string, sortIntoCat
 	return outPath, nil
 }
 
-func getFileCreatedDateTime(fileInfo fs.FileInfo) time.Time {
+func getFileCreatedDateTime(fileInfo fs.FileInfo, fileDir string) time.Time {
+	dateTaken, err := getExifDateTaken(path.Join(fileDir, fileInfo.Name()))
+	if err == nil {
+		return dateTaken
+	}
+
 	created := fileInfo.ModTime()
 
 	if runtime.GOOS == "windows" {
@@ -139,6 +147,26 @@ func getFileCreatedDateTime(fileInfo fs.FileInfo) time.Time {
 	}
 
 	return created
+}
+
+func getExifDateTaken(filePath string) (time.Time, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("open file %s: %v", filePath, err)
+	}
+	defer file.Close()
+
+	x, err := exif.Decode(file)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("decode exif data from file %s: %v", filePath, err)
+	}
+
+	dateTaken, err := x.DateTime()
+	if err != nil {
+		return time.Time{}, fmt.Errorf("get Date Taken from exif data: %v", err)
+	}
+
+	return dateTaken, nil
 }
 
 func constructOutPath(parentPath string, fileName string, sortIntoCategories bool) (string, error) {
@@ -155,6 +183,10 @@ func constructOutPath(parentPath string, fileName string, sortIntoCategories boo
 			categoryDir = path.Join(parentPath, VideosDirName)
 		}
 
+		if isGif(fileName) {
+			categoryDir = path.Join(parentPath, GifsDirName)
+		}
+
 		if err := createDirIfNotExists(categoryDir); err != nil {
 			return "", fmt.Errorf("create category directory %s: %v", categoryDir, err)
 		}
@@ -166,7 +198,7 @@ func constructOutPath(parentPath string, fileName string, sortIntoCategories boo
 }
 
 func preserveOriginalFileCreationDate(fileInfo os.FileInfo, filePath string) error {
-	createdTime := getFileCreatedDateTime(fileInfo)
+	createdTime := getFileCreatedDateTime(fileInfo, filePath)
 
 	if runtime.GOOS == "windows" {
 		return setWindowsFileCreationDateTime(filePath, createdTime)
@@ -294,6 +326,16 @@ func isPicture(fileName string) bool {
 func isVideo(fileName string) bool {
 	normalizedFileName := strings.ToLower(fileName)
 	for _, ext := range videoFileExtensions {
+		if strings.HasSuffix(normalizedFileName, ext) {
+			return true
+		}
+	}
+	return false
+}
+
+func isGif(fileName string) bool {
+	normalizedFileName := strings.ToLower(fileName)
+	for _, ext := range gifFileExtensions {
 		if strings.HasSuffix(normalizedFileName, ext) {
 			return true
 		}
