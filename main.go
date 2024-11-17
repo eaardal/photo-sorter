@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -25,6 +26,14 @@ const (
 var pictureFileExtensions = []string{".jpg", ".png", ".heic", ".jpeg", ".dng", ".arw"}
 var videoFileExtensions = []string{".mp4", ".mov", ".webp"}
 var gifFileExtensions = []string{".gif"}
+var fileDateTimeFormats = []string{
+	"2006-01-02_15-04-05",
+	"2006-01-02",
+	"20060102",
+	"20060102_150405",
+	"20060102_150405",
+	"PXL_20060102_150405",
+}
 
 var sourceDirArg = flag.String("source", "", "Source directory")
 var outDirArg = flag.String("out", "", "Output directory")
@@ -68,49 +77,77 @@ func sortFiles(sourceDir string, outDir string, fileExtensions []string, sortInt
 		return fmt.Errorf("read source dir %s: %v", sourceDir, err)
 	}
 
-	for _, item := range items {
-		if item.IsDir() {
-			continue
-		}
+	fileChan := make(chan fs.DirEntry)
+	var wg sync.WaitGroup
 
-		fileName := item.Name()
+	// Start worker goroutines for each CPU core
+	numWorkers := runtime.NumCPU()
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
 
-		fileInfo, err := item.Info()
-		if err != nil {
-			return fmt.Errorf("get file info for %s: %v", fileName, err)
-		}
+		go func() {
+			defer wg.Done()
 
-		if !shouldBeSorted(fileName, fileExtensions) {
-			log.Printf("file %s does not match allowed file extensions %+v, skipping", fileName, fileExtensions)
-			continue
-		}
+			// Process files from the channel
+			for item := range fileChan {
+				if item.IsDir() {
+					continue
+				}
 
-		log.Printf("copying file %s", fileName)
+				fileName := item.Name()
+				fileInfo, err := item.Info()
+				if err != nil {
+					log.Printf("get file info for %s: %v", fileName, err)
+					continue
+				}
 
-		outPath, err := copyFile(fileInfo, sourceDir, outDir, sortIntoCategories)
-		if err != nil {
-			return fmt.Errorf("copy file %s: %v", fileName, err)
-		}
+				if !shouldBeSorted(fileName, fileExtensions) {
+					log.Printf("file %s does not match allowed file extensions %+v, skipping", fileName, fileExtensions)
+					continue
+				}
 
-		if err := preserveOriginalFileCreationDate(fileInfo, outPath); err != nil {
-			return fmt.Errorf("preserve original file creation date: %v", err)
-		}
+				log.Printf("copying file %s", fileName)
+				outPath, err := copyFile(fileInfo, sourceDir, outDir, sortIntoCategories)
+				if err != nil {
+					log.Printf("copy file %s: %v", fileName, err)
+					continue
+				}
 
-		log.Printf("file %s copied to %s", fileName, outPath)
+				if err := preserveOriginalFileCreationDate(fileInfo, outPath); err != nil {
+					log.Printf("preserve original file creation date: %v", err)
+				}
+
+				log.Printf("file %s copied to %s", fileName, outPath)
+			}
+		}()
 	}
+
+	// Send files to be processed by each worker
+	for _, item := range items {
+		fileChan <- item
+	}
+	close(fileChan)
+
+	// Wait for all workers to finish
+	wg.Wait()
 
 	return nil
 }
 
 func copyFile(fileInfo fs.FileInfo, sourceDir string, outDir string, sortIntoCategories bool) (string, error) {
 	fileName := fileInfo.Name()
+
+	// Get the date when the file was created (ideally when the picture was taken)
 	fileCreationDate := getFileCreatedDateTime(fileInfo, sourceDir)
+
+	// Use the year and month to sort the files into subdirectories
 	fileCreationYear := fileCreationDate.Year()
 	fileCreationMonth := fileCreationDate.Month()
 	fileCreationDay := fileCreationDate.Day()
 
 	log.Printf("file %s created on %d-%02d-%02d", fileName, fileCreationYear, fileCreationMonth, fileCreationDay)
 
+	// Put files into subdirectories on the format YYYY-MM
 	monthDir := path.Join(outDir, fmt.Sprintf("%d-%02d", fileCreationYear, fileCreationMonth))
 	if err := createDirIfNotExists(monthDir); err != nil {
 		return "", fmt.Errorf("create month directory %s: %v", monthDir, err)
@@ -134,19 +171,44 @@ func copyFile(fileInfo fs.FileInfo, sourceDir string, outDir string, sortIntoCat
 }
 
 func getFileCreatedDateTime(fileInfo fs.FileInfo, fileDir string) time.Time {
+	// First try to get the date taken from the EXIF data
 	dateTaken, err := getExifDateTaken(path.Join(fileDir, fileInfo.Name()))
+	if err == nil {
+		// Ignore the error and return the date taken if it was successfully retrieved
+		return dateTaken
+	}
+
+	// If the EXIF data is not available, try to get the date taken from the file name
+	dateTaken, err = getDateTakenFromFileName(fileInfo.Name())
 	if err == nil {
 		return dateTaken
 	}
 
+	// If we can't get the date from EXIF or the file name, fall back to get the file's modified time on disk.
+	// This will most likely be the datetime for when the file was copied to this hard drive instead of when the picture was actually taken (unfortunately).
 	created := fileInfo.ModTime()
 
 	if runtime.GOOS == "windows" {
+		// On Windows, we can get the file creation time from the file attributes
 		attr := fileInfo.Sys().(*syscall.Win32FileAttributeData)
 		created = time.Unix(0, attr.CreationTime.Nanoseconds())
 	}
 
 	return created
+}
+
+func getDateTakenFromFileName(fileName string) (time.Time, error) {
+	// Getting the date the picture was taken from the file name is a hail mary since if the camera follows a date format, it most likely also writes the date to the EXIF data.
+	// But in a rare case where we couldn't get the EXIF data, we can try to parse the date from the file name as a fallback.
+	for _, format := range fileDateTimeFormats {
+		dateTaken, err := time.Parse(format, fileName)
+		if err == nil {
+			log.Printf("parsed date taken %s from file name %s", dateTaken, fileName)
+			return dateTaken, nil
+		}
+	}
+
+	return time.Time{}, fmt.Errorf("no date taken found in file name")
 }
 
 func getExifDateTaken(filePath string) (time.Time, error) {
@@ -214,7 +276,9 @@ func preserveOriginalFileCreationDate(fileInfo os.FileInfo, filePath string) err
 	return nil
 }
 
+// setWindowsFileCreationDateTime sets the creation time of a file on Windows using Windows APIs via syscall.
 func setWindowsFileCreationDateTime(filename string, ctime time.Time) error {
+	// Convert the filename to a UTF16 pointer
 	filePath, err := syscall.UTF16PtrFromString(filename)
 	if err != nil {
 		return fmt.Errorf("resolve filePath from filename %s: %v", filename, err)
