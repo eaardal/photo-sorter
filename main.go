@@ -97,7 +97,7 @@ func sortFiles(sourceDir string, outDir string, fileExtensions []string, sortInt
 				fileName := item.Name()
 				fileInfo, err := item.Info()
 				if err != nil {
-					log.Printf("get file info for %s: %v", fileName, err)
+					log.Printf("ERROR: get file info for %s: %v", fileName, err)
 					continue
 				}
 
@@ -109,12 +109,12 @@ func sortFiles(sourceDir string, outDir string, fileExtensions []string, sortInt
 				log.Printf("copying file %s", fileName)
 				outPath, err := copyFile(fileInfo, sourceDir, outDir, sortIntoCategories)
 				if err != nil {
-					log.Printf("copy file %s: %v", fileName, err)
+					log.Printf("ERROR: copy file %s: %v", fileName, err)
 					continue
 				}
 
 				if err := preserveOriginalFileCreationDate(fileInfo, outPath); err != nil {
-					log.Printf("preserve original file creation date: %v", err)
+					log.Printf("ERROR: preserve original file creation date: %v", err)
 				}
 
 				log.Printf("file %s copied to %s", fileName, outPath)
