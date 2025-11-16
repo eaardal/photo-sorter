@@ -2,7 +2,7 @@ clean-dist:
 	rm -rf ./dist
 
 build:
-	go build -o photosorter.exe ./...
+	go build -o photosorter.exe main.go
 
 build-windows:
 	GOOS=windows GOARCH=amd64 go build -o ./dist/windows/photosorter.exe ./...

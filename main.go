@@ -4,6 +4,8 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/go-ole/go-ole"
+	"github.com/go-ole/go-ole/oleutil"
 	"github.com/rwcarlsen/goexif/exif"
 	"io/fs"
 	"log"
@@ -82,10 +84,12 @@ func sortFiles(sourceDir string, outDir string, fileExtensions []string, sortInt
 
 	// Start worker goroutines for each CPU core
 	numWorkers := runtime.NumCPU()
-	for i := 0; i < numWorkers; i++ {
+	log.Printf("starting %d workers", numWorkers)
+
+	for workerIndex := 0; workerIndex < numWorkers; workerIndex++ {
 		wg.Add(1)
 
-		go func() {
+		go func(worker int) {
 			defer wg.Done()
 
 			// Process files from the channel
@@ -97,29 +101,29 @@ func sortFiles(sourceDir string, outDir string, fileExtensions []string, sortInt
 				fileName := item.Name()
 				fileInfo, err := item.Info()
 				if err != nil {
-					log.Printf("ERROR: get file info for %s: %v", fileName, err)
+					log.Printf("%d/%d: ERROR: get file info for %s: %v", worker, numWorkers, fileName, err)
 					continue
 				}
 
 				if !shouldBeSorted(fileName, fileExtensions) {
-					log.Printf("file %s does not match allowed file extensions %+v, skipping", fileName, fileExtensions)
+					log.Printf("%d/%d: file %s does not match allowed file extensions %+v, skipping", worker, numWorkers, fileName, fileExtensions)
 					continue
 				}
 
-				log.Printf("copying file %s", fileName)
+				log.Printf("%d/%d: copying file %s", worker, numWorkers, fileName)
 				outPath, err := copyFile(fileInfo, sourceDir, outDir, sortIntoCategories)
 				if err != nil {
-					log.Printf("ERROR: copy file %s: %v", fileName, err)
+					log.Printf("%d/%d: ERROR: copy file %s: %v", worker, numWorkers, fileName, err)
 					continue
 				}
 
 				if err := preserveOriginalFileCreationDate(fileInfo, outPath); err != nil {
-					log.Printf("ERROR: preserve original file creation date: %v", err)
+					log.Printf("%d/%d: ERROR: preserve original file creation date: %v", worker, numWorkers, err)
 				}
 
-				log.Printf("file %s copied to %s", fileName, outPath)
+				log.Printf("%d/%d: file %s copied to %s", worker, numWorkers, fileName, outPath)
 			}
-		}()
+		}(workerIndex)
 	}
 
 	// Send files to be processed by each worker
@@ -136,24 +140,37 @@ func sortFiles(sourceDir string, outDir string, fileExtensions []string, sortInt
 
 func copyFile(fileInfo fs.FileInfo, sourceDir string, outDir string, sortIntoCategories bool) (string, error) {
 	fileName := fileInfo.Name()
+	fileOutDir := ""
 
 	// Get the date when the file was created (ideally when the picture was taken)
-	fileCreationDate := getFileCreatedDateTime(fileInfo, sourceDir)
+	fileCreationDate, err := getFileCreatedDateTime(fileInfo, sourceDir)
+	if fileCreationDate == nil || err != nil {
+		unknownDirName := "_UnknownDateTime"
 
-	// Use the year and month to sort the files into subdirectories
-	fileCreationYear := fileCreationDate.Year()
-	fileCreationMonth := fileCreationDate.Month()
-	fileCreationDay := fileCreationDate.Day()
+		log.Printf("file %s creation date unknown, putting into %s", fileName, unknownDirName)
 
-	log.Printf("file %s created on %d-%02d-%02d", fileName, fileCreationYear, fileCreationMonth, fileCreationDay)
+		unknownDir := path.Join(outDir, unknownDirName)
+		if err := createDirIfNotExists(unknownDir); err != nil {
+			return "", fmt.Errorf("create unknown date time directory %s: %v", unknownDir, err)
+		}
+		fileOutDir = unknownDir
+	} else {
+		// Use the year and month to sort the files into subdirectories
+		fileCreationYear := fileCreationDate.Year()
+		fileCreationMonth := fileCreationDate.Month()
+		fileCreationDay := fileCreationDate.Day()
 
-	// Put files into subdirectories on the format YYYY-MM
-	monthDir := path.Join(outDir, fmt.Sprintf("%d-%02d", fileCreationYear, fileCreationMonth))
-	if err := createDirIfNotExists(monthDir); err != nil {
-		return "", fmt.Errorf("create month directory %s: %v", monthDir, err)
+		log.Printf("file %s created on %d-%02d-%02d", fileName, fileCreationYear, fileCreationMonth, fileCreationDay)
+
+		// Put files into subdirectories on the format YYYY-MM
+		monthDir := path.Join(outDir, fmt.Sprintf("%d-%02d", fileCreationYear, fileCreationMonth))
+		if err := createDirIfNotExists(monthDir); err != nil {
+			return "", fmt.Errorf("create month directory %s: %v", monthDir, err)
+		}
+		fileOutDir = monthDir
 	}
 
-	outPath, err := constructOutPath(monthDir, fileName, sortIntoCategories)
+	outPath, err := constructOutPath(fileOutDir, fileName, sortIntoCategories)
 	if err != nil {
 		return "", fmt.Errorf("construct out path for %s: %v", fileName, err)
 	}
@@ -170,65 +187,146 @@ func copyFile(fileInfo fs.FileInfo, sourceDir string, outDir string, sortIntoCat
 	return outPath, nil
 }
 
-func getFileCreatedDateTime(fileInfo fs.FileInfo, fileDir string) time.Time {
+func getFileCreatedDateTime(fileInfo fs.FileInfo, fileDir string) (*time.Time, error) {
+
+	filePath := path.Join(fileDir, fileInfo.Name())
+
 	// First try to get the date taken from the EXIF data
-	dateTaken, err := getExifDateTaken(path.Join(fileDir, fileInfo.Name()))
-	if err == nil {
+	dateTaken, err := getExifDateTaken(filePath)
+	if err == nil && dateTaken != nil {
 		// Ignore the error and return the date taken if it was successfully retrieved
-		return dateTaken
+		return dateTaken, nil
 	}
 
 	// If the EXIF data is not available, try to get the date taken from the file name
 	dateTaken, err = getDateTakenFromFileName(fileInfo.Name())
-	if err == nil {
-		return dateTaken
+	if err == nil && dateTaken != nil {
+		return dateTaken, nil
 	}
 
-	// If we can't get the date from EXIF or the file name, fall back to get the file's modified time on disk.
-	// This will most likely be the datetime for when the file was copied to this hard drive instead of when the picture was actually taken (unfortunately).
-	created := fileInfo.ModTime()
-
-	if runtime.GOOS == "windows" {
-		// On Windows, we can get the file creation time from the file attributes
-		attr := fileInfo.Sys().(*syscall.Win32FileAttributeData)
-		created = time.Unix(0, attr.CreationTime.Nanoseconds())
+	dateTaken, err = getDateTakenFromFileMediaCreatedAttribute(filePath)
+	if err == nil && dateTaken != nil {
+		return dateTaken, nil
 	}
 
-	return created
+	if dateTaken == nil {
+		return nil, fmt.Errorf("unable to determine date taken for file %s", filePath)
+	}
+
+	return dateTaken, nil
+
+	//// If we can't get the date from EXIF or the file name, fall back to get the file's modified time on disk.
+	//// This will most likely be the datetime for when the file was copied to this hard drive instead of when the picture was actually taken (unfortunately).
+	//created := fileInfo.ModTime()
+	//
+	//if runtime.GOOS == "windows" {
+	//	// On Windows, we can get the file creation time from the file attributes
+	//	attr := fileInfo.Sys().(*syscall.Win32FileAttributeData)
+	//	created = time.Unix(0, attr.CreationTime.Nanoseconds())
+	//}
+	//
+	//return created
 }
 
-func getDateTakenFromFileName(fileName string) (time.Time, error) {
+// On windows, media files may have a "Media Created" attribute that can be used to get the date the media was created.
+// How to inspect a file: On a file, right click -> Properties -> Details -> Origin -> Media created
+func getDateTakenFromFileMediaCreatedAttribute(path string) (*time.Time, error) {
+	abs, _ := filepath.Abs(path)
+	abs = strings.ReplaceAll(abs, "/", `\`)
+
+	ole.CoInitialize(0)
+	defer ole.CoUninitialize()
+
+	// Create Shell object
+	shellObj, err := oleutil.CreateObject("Shell.Application")
+	if err != nil {
+		return nil, err
+	}
+	shell, err := shellObj.QueryInterface(ole.IID_IDispatch)
+	if err != nil {
+		return nil, err
+	}
+	defer shell.Release()
+
+	// Split into folder + file name
+	folderPath, fileName := filepath.Split(abs)
+
+	folderObj, err := oleutil.CallMethod(shell, "NameSpace", folderPath)
+	if err != nil || folderObj == nil {
+		return nil, fmt.Errorf("failed to open folder")
+	}
+	folder := folderObj.ToIDispatch()
+	defer folder.Release()
+
+	fileObj, err := oleutil.CallMethod(folder, "ParseName", fileName)
+	if err != nil || fileObj == nil {
+		return nil, fmt.Errorf("failed to resolve file in folder")
+	}
+	item := fileObj.ToIDispatch()
+	defer item.Release()
+
+	// See ./cmd/debug.main.go for listing all possible property indexes
+	const mediaCreatedIndex = 208 // 208 = "Media created" in Windows property index map
+	const dateTakenIndex = 12     // 12 = "Date taken" in Windows property index map
+
+	mediaCreatedObj, err := oleutil.CallMethod(folder, "GetDetailsOf", item, mediaCreatedIndex)
+	if err != nil || mediaCreatedObj == nil {
+		mediaCreatedObj, err = oleutil.CallMethod(folder, "GetDetailsOf", item, dateTakenIndex)
+		if err != nil || mediaCreatedObj == nil {
+			return nil, fmt.Errorf("property lookup failed")
+		}
+	}
+
+	raw := strings.TrimSpace(mediaCreatedObj.ToString())
+	if raw == "" {
+		return nil, fmt.Errorf("no value in Media Created field")
+	}
+
+	// Windows formats: "dd.MM.yyyy HH:mm"
+	parsed, err := time.Parse("1/2/2006 3:04 PM", raw)
+	if err != nil {
+		// Try another common Windows format
+		parsed, err = time.Parse("2006-01-02 15:04:05", raw)
+		if err != nil {
+			return nil, fmt.Errorf("parse error: %w (%s)", err, raw)
+		}
+	}
+
+	return &parsed, nil
+}
+
+func getDateTakenFromFileName(fileName string) (*time.Time, error) {
 	// Getting the date the picture was taken from the file name is a hail mary since if the camera follows a date format, it most likely also writes the date to the EXIF data.
 	// But in a rare case where we couldn't get the EXIF data, we can try to parse the date from the file name as a fallback.
 	for _, format := range fileDateTimeFormats {
 		dateTaken, err := time.Parse(format, fileName)
 		if err == nil {
 			log.Printf("parsed date taken %s from file name %s", dateTaken, fileName)
-			return dateTaken, nil
+			return &dateTaken, nil
 		}
 	}
 
-	return time.Time{}, fmt.Errorf("no date taken found in file name")
+	return nil, fmt.Errorf("no date taken found in file name")
 }
 
-func getExifDateTaken(filePath string) (time.Time, error) {
+func getExifDateTaken(filePath string) (*time.Time, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
-		return time.Time{}, fmt.Errorf("open file %s: %v", filePath, err)
+		return nil, fmt.Errorf("open file %s: %v", filePath, err)
 	}
 	defer file.Close()
 
 	x, err := exif.Decode(file)
 	if err != nil {
-		return time.Time{}, fmt.Errorf("decode exif data from file %s: %v", filePath, err)
+		return nil, fmt.Errorf("decode exif data from file %s: %v", filePath, err)
 	}
 
 	dateTaken, err := x.DateTime()
 	if err != nil {
-		return time.Time{}, fmt.Errorf("get Date Taken from exif data: %v", err)
+		return nil, fmt.Errorf("get Date Taken from exif data: %v", err)
 	}
 
-	return dateTaken, nil
+	return &dateTaken, nil
 }
 
 func constructOutPath(parentPath string, fileName string, sortIntoCategories bool) (string, error) {
@@ -260,14 +358,19 @@ func constructOutPath(parentPath string, fileName string, sortIntoCategories boo
 }
 
 func preserveOriginalFileCreationDate(fileInfo os.FileInfo, filePath string) error {
-	createdTime := getFileCreatedDateTime(fileInfo, filePath)
+	dirPath := path.Dir(filePath)
 
-	if runtime.GOOS == "windows" {
-		return setWindowsFileCreationDateTime(filePath, createdTime)
+	createdTime, err := getFileCreatedDateTime(fileInfo, dirPath)
+	if createdTime == nil {
+		return fmt.Errorf("get original file creation date for %s: %v", fileInfo.Name(), err)
 	}
 
-	modifiedTime := createdTime
-	accessTime := createdTime
+	if runtime.GOOS == "windows" {
+		return setWindowsFileCreationDateTime(filePath, *createdTime)
+	}
+
+	modifiedTime := *createdTime
+	accessTime := *createdTime
 
 	if err := os.Chtimes(filePath, accessTime, modifiedTime); err != nil {
 		return fmt.Errorf("set file %s modification time: %v", fileInfo.Name(), err)
