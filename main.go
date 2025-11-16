@@ -43,6 +43,12 @@ var fileExtensionsArg = flag.String("ext", "*", "File extensions to sort, comma 
 var sortCategoriesArg = flag.Bool("categories", true, "Sort files into categories (pictures, videos)")
 
 func main() {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Fatalf("FATAL: %v", r)
+		}
+	}()
+
 	flag.Parse()
 
 	if sourceDirArg == nil {
@@ -188,7 +194,6 @@ func copyFile(fileInfo fs.FileInfo, sourceDir string, outDir string, sortIntoCat
 }
 
 func getFileCreatedDateTime(fileInfo fs.FileInfo, fileDir string) (*time.Time, error) {
-
 	filePath := path.Join(fileDir, fileInfo.Name())
 
 	// First try to get the date taken from the EXIF data
@@ -282,15 +287,17 @@ func getDateTakenFromFileMediaCreatedAttribute(path string) (*time.Time, error) 
 		return nil, fmt.Errorf("no value in Media Created field")
 	}
 
-	// Windows formats: "dd.MM.yyyy HH:mm"
-	parsed, err := time.Parse("1/2/2006 3:04 PM", raw)
+	raw = strings.ReplaceAll(raw, " ", "")       // Remove all spaces
+	raw = strings.ReplaceAll(raw, "\u00A0", "")  // Remove non-breaking spaces
+	raw = strings.ReplaceAll(raw, "\u200E", "")  // Remove left-to-right mark
+	raw = strings.ReplaceAll(raw, "\u200F", ".") // Remove right-to-left mark
+
+	parsed, err := time.Parse("02.01.2006.15:04", raw)
 	if err != nil {
-		// Try another common Windows format
-		parsed, err = time.Parse("2006-01-02 15:04:05", raw)
-		if err != nil {
-			return nil, fmt.Errorf("parse error: %w (%s)", err, raw)
-		}
+		log.Printf("ERROR: failed to parse Media Created for file %s: %v", fileName, err)
+		return nil, fmt.Errorf("parse error: %w (%s)", err, raw)
 	}
+	log.Printf("parsed Media Created for file %s: %+v", fileName, parsed.String())
 
 	return &parsed, nil
 }
